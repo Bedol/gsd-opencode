@@ -126,10 +126,25 @@ function copyWithPathReplacement(srcDir, destDir, pathPrefix) {
     if (entry.isDirectory()) {
       copyWithPathReplacement(srcPath, destPath, pathPrefix);
     } else if (entry.name.endsWith(".md")) {
-      // Replace ~/.claude/ and ./.claude/ with OpenCode paths
+      // Replace repo-local prompt references so installed prompts work outside this repo.
+      // IMPORTANT: order matters to avoid double-rewrites.
       let content = fs.readFileSync(srcPath, "utf8");
+
+      // 1) @-references to this repo → install-relative @-references
+      //    @gsd-opencode/... → @~/.config/opencode/... (global)
+      //    @gsd-opencode/... → @./.opencode/... (local)
+      content = content.replace(/@gsd-opencode\//g, `@${pathPrefix}`);
+
+      // 2) Plain (non-@) repo-local paths → install-relative paths
+      //    gsd-opencode/... → ~/.config/opencode/... (global)
+      //    gsd-opencode/... → ./.opencode/... (local)
+      content = content.replace(/\bgsd-opencode\//g, pathPrefix);
+
+      // 3) Back-compat: rewrite legacy Claude paths → OpenCode paths
+      // NOTE: keep these rewrites verbatim for backward compatibility.
       content = content.replace(/~\/\.claude\//g, pathPrefix);
       content = content.replace(/\.\/\.claude\//g, "./.opencode/");
+
       fs.writeFileSync(destPath, content);
     } else {
       fs.copyFileSync(srcPath, destPath);
@@ -164,6 +179,68 @@ function install(isGlobal) {
       : "~/.config/opencode/"
     : "./.opencode/";
 
+  function scanForUnresolvedRepoLocalTokens(destRoot) {
+    const tokenRegex = /@gsd-opencode\/|\bgsd-opencode\//g;
+    const maxHits = 10;
+    const hits = [];
+
+    function walk(dir) {
+      const entries = fs.readdirSync(dir, { withFileTypes: true });
+      for (const entry of entries) {
+        if (hits.length >= maxHits) return;
+
+        const filePath = path.join(dir, entry.name);
+        if (entry.isDirectory()) {
+          walk(filePath);
+          continue;
+        }
+
+        if (!entry.name.endsWith(".md")) continue;
+
+        const content = fs.readFileSync(filePath, "utf8");
+        tokenRegex.lastIndex = 0;
+        if (!tokenRegex.test(content)) continue;
+
+        // Capture a readable snippet (first matching line)
+        const lines = content.split(/\r?\n/);
+        for (let i = 0; i < lines.length; i++) {
+          tokenRegex.lastIndex = 0;
+          if (tokenRegex.test(lines[i])) {
+            hits.push({
+              file: filePath,
+              line: i + 1,
+              snippet: lines[i].trim().slice(0, 200),
+            });
+            break;
+          }
+        }
+      }
+    }
+
+    walk(destRoot);
+
+    if (hits.length > 0) {
+      console.log(
+        `\n  ${yellow}⚠️  Install sanity check: unresolved repo-local tokens found${reset}`,
+      );
+      console.log(
+        `  ${yellow}This may cause commands like /gsd-settings to fail in other repos (ENOENT).${reset}`,
+      );
+      console.log(`  ${dim}Showing up to ${maxHits} matches:${reset}`);
+
+      for (const hit of hits) {
+        const displayPath = isGlobal
+          ? hit.file.replace(os.homedir(), "~")
+          : hit.file.replace(process.cwd(), ".");
+        console.log(
+          `  - ${displayPath}:${hit.line}\n    ${dim}${hit.snippet}${reset}`,
+        );
+      }
+
+      console.log("");
+    }
+  }
+
   console.log(`  Installing to ${cyan}${locationLabel}${reset}\n`);
 
   // Create commands directory (singular "command" not "commands")
@@ -187,6 +264,9 @@ function install(isGlobal) {
   const skillDest = path.join(opencodeDir, "get-shit-done");
   copyWithPathReplacement(skillSrc, skillDest, pathPrefix);
   console.log(`  ${green}✓${reset} Installed get-shit-done`);
+
+  // Post-install diagnostic (do not fail install).
+  scanForUnresolvedRepoLocalTokens(opencodeDir);
 
   // Create VERSION file
   fs.writeFileSync(path.join(skillDest, "VERSION"), `v${pkg.version}`);
